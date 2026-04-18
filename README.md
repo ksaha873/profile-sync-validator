@@ -33,7 +33,7 @@ The pipeline runs twice if both artifacts are requested — once for `identifier
 ## Usage
 
 ```bash
-aws-okta exec prod-write -- go run . \
+aws-okta exec prod-write -- go run ./cmd/profile-sync-validator \
   --space-id spa_7dwJTm2tmQFEwcECEbYMu3 \
   --warehouse-id w5tevAWoyfNRmdisUcdavB \
   --schema-name personas_main_2 \
@@ -66,8 +66,9 @@ aws-okta exec prod-write -- go run . \
 ## Layout
 
 ```
-main.go                       CLI entry point
-validator/
+cmd/profile-sync-validator/
+  main.go                     CLI entry point
+internal/validator/
   config.go                   ValidationRun, Artifact/Warehouse enums
   errors.go                   SystemError, ValidationError, MultiError
   athena.go                   Thin Athena SDK wrapper (retry + poll)

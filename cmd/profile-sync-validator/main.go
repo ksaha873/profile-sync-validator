@@ -13,7 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/athena"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/ksaha873/profile-sync-validator/validator"
+	"github.com/ksaha873/profile-sync-validator/internal/validator"
 )
 
 func main() {
