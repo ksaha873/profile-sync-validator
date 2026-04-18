@@ -1,0 +1,14 @@
+SELECT 'CREATE EXTERNAL TABLE {{.LoaderTable}} (' || chr(10)
+    || array_join(
+        transform(columns, c -> '    `' || c.name || '` string'),
+        ',' || chr(10)
+    ) || chr(10)
+    || ')' || chr(10)
+    || 'ROW FORMAT DELIMITED FIELDS TERMINATED BY '',''' || chr(10)
+    || 'STORED AS INPUTFORMAT ''org.apache.hadoop.mapred.TextInputFormat''' || chr(10)
+    || 'OUTPUTFORMAT ''org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat''' || chr(10)
+    || 'LOCATION ''s3://{{.Bucket}}/{{.WarehouseID}}/personas_{{.SpaceID}}/{{.SchemaName}}/user_identifiers/'''
+    AS ddl
+FROM {{.SchemaReaderTable}}
+WHERE "$path" LIKE '%schema.json'
+LIMIT 1

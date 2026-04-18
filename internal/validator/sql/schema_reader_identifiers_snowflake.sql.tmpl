@@ -1,0 +1,7 @@
+CREATE EXTERNAL TABLE {{.SchemaReaderTable}} (
+    columns array<struct<name:string, type:string>>
+)
+ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
+STORED AS INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat'
+OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+LOCATION 's3://{{.Bucket}}/{{.WarehouseID}}/personas_{{.SpaceID}}/{{.SchemaName}}/user_identifiers/'
