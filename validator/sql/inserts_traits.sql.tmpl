@@ -1,0 +1,76 @@
+WITH params AS (
+    SELECT '{{.SpaceID}}' AS space_id,
+        '{{.Day}}' AS day,
+        '{{.StartAt}}' AS start_at,
+        '{{.EndAt}}' AS end_at,
+        '{{.TombstonedStartAt}}' AS tombstoned_start_at,
+        '{{.TombstonedEndAt}}' AS tombstoned_end_at
+),
+merged_segments AS (
+    SELECT DISTINCT d.segment_id
+    FROM {{.DataV3Table}} d, params p
+    WHERE d.namespace_id = p.space_id
+        AND d.day_written = CAST(CAST(to_unixtime(date_parse(p.day, '%Y-%m-%d')) * 1000 AS BIGINT) AS VARCHAR)
+        AND d.summary = 'TOMBSTONED'
+        AND d.accepted_at >= p.tombstoned_start_at
+        AND d.accepted_at < p.tombstoned_end_at
+),
+filtered_patches AS (
+    SELECT d.*, d."$path" AS s3_path
+    FROM {{.DataV3Table}} d, params p
+    WHERE d.namespace_id = p.space_id
+        AND d.day_written = CAST(CAST(to_unixtime(date_parse(p.day, '%Y-%m-%d')) * 1000 AS BIGINT) AS VARCHAR)
+        AND d.summary IN ('NORMAL', 'CREATED', 'REEMIT', 'MERGED')
+        AND d.segment_id NOT LIKE 'acc_%'
+        AND d.accepted_at >= p.start_at
+        AND d.accepted_at < p.end_at
+        AND d.segment_id NOT IN (SELECT segment_id FROM merged_segments)
+),
+normalize_key AS (
+    SELECT *, lower(regexp_replace(regexp_replace(
+        regexp_replace(regexp_replace(
+            regexp_replace(raw_key, '[^a-zA-Z0-9]', '_'),
+        '([A-Z]+)([A-Z][a-z])', '$1_$2'),
+        '([a-z0-9])([A-Z])', '$1_$2'), '_{2,}', '_'), '^_', '')) AS trait_key
+    FROM (
+        SELECT p.segment_id AS canonical_segment_id, tr.key AS raw_key,
+            date_format(from_iso8601_timestamp(p.accepted_at), '%Y-%m-%dT%H:%i:%s.') ||
+            LPAD(CAST(millisecond(from_iso8601_timestamp(p.accepted_at)) AS varchar), 3, '0') || 'Z' AS accepted_at,
+            p.s3_path
+        FROM filtered_patches p
+            CROSS JOIN UNNEST(p.traits) AS t(tr)
+        WHERE ((p.summary != 'MERGED' AND tr.status = 'CHANGED' AND tr.curr_value IS NOT NULL) OR (p.summary = 'MERGED'))
+    )
+),
+unnested_traits AS (
+    SELECT canonical_segment_id,
+        lower(to_hex(sha1(to_utf8(canonical_segment_id || trait_key)))) AS id,
+        trait_key AS name,
+        accepted_at, s3_path
+    FROM normalize_key
+),
+patches AS (
+    SELECT canonical_segment_id, id, name, accepted_at, s3_path
+    FROM (
+        SELECT *, row_number() OVER (PARTITION BY id ORDER BY accepted_at DESC) AS rn
+        FROM unnested_traits
+    ) WHERE rn = 1
+),
+loader AS (
+    SELECT canonical_segment_id, lower(id) AS id, name, accepted_at
+    FROM (
+        SELECT l.canonical_segment_id, l.id, l.name,
+            date_format(from_unixtime(CAST(CAST(l.{{.ProfileVersionCol}} AS bigint) / 1000000000 AS double)), '%Y-%m-%dT%H:%i:%s.') ||
+            LPAD(CAST((CAST(l.{{.ProfileVersionCol}} AS bigint) / 1000000) % 1000 AS varchar), 3, '0') || 'Z' AS accepted_at,
+            row_number() OVER (PARTITION BY l.id ORDER BY CAST(l.{{.ProfileVersionCol}} AS bigint) DESC) AS rn
+        FROM {{.LoaderTable}} l, params p
+        WHERE l."$path" LIKE '{{.OutputPathPattern}}'
+            AND {{.DeletedNotTrue}}
+            AND CAST(l.{{.ProfileVersionCol}} AS bigint) BETWEEN CAST(to_unixtime(from_iso8601_timestamp(p.start_at)) * 1000000000 AS bigint)
+                AND CAST(to_unixtime(from_iso8601_timestamp(p.end_at)) * 1000000000 AS bigint)
+    ) WHERE rn = 1
+)
+SELECT COUNT(*) AS mismatch_count
+FROM patches p
+    LEFT JOIN loader l ON p.id = l.id AND p.accepted_at = l.accepted_at
+WHERE l.id IS NULL
