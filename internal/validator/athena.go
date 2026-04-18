@@ -107,6 +107,39 @@ func (c *AthenaClient) ExecScalarInt64(ctx context.Context, step, sql string) (i
 	return n, nil
 }
 
+// ExecRowInt64s runs a single SQL statement and returns the integer values of
+// every column in the first data row. Used for multi-count validation queries
+// that return expected / loader / mismatch counts in one shot.
+func (c *AthenaClient) ExecRowInt64s(ctx context.Context, step, sql string) ([]int64, error) {
+	qid, err := c.execWithRetry(ctx, step, sql)
+	if err != nil {
+		return nil, err
+	}
+	out, err := c.api.GetQueryResults(ctx, &athena.GetQueryResultsInput{
+		QueryExecutionId: aws.String(qid),
+		MaxResults:       aws.Int32(2),
+	})
+	if err != nil {
+		return nil, &SystemError{Step: step, Err: fmt.Errorf("get_query_results: %w", err)}
+	}
+	if len(out.ResultSet.Rows) < 2 {
+		return nil, &SystemError{Step: step, Err: fmt.Errorf("expected at least one data row, got %d", len(out.ResultSet.Rows))}
+	}
+	row := out.ResultSet.Rows[1]
+	vals := make([]int64, 0, len(row.Data))
+	for i, cell := range row.Data {
+		if cell.VarCharValue == nil {
+			return nil, &SystemError{Step: step, Err: fmt.Errorf("column %d is empty", i)}
+		}
+		var n int64
+		if _, err := fmt.Sscan(*cell.VarCharValue, &n); err != nil {
+			return nil, &SystemError{Step: step, Err: fmt.Errorf("parse int from column %d %q: %w", i, *cell.VarCharValue, err)}
+		}
+		vals = append(vals, n)
+	}
+	return vals, nil
+}
+
 func (c *AthenaClient) execWithRetry(ctx context.Context, step, sql string) (string, error) {
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
