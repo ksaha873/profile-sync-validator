@@ -1,0 +1,7 @@
+*.exe
+*.test
+*.out
+profile-sync-validator
+.DS_Store
+.idea/
+.vscode/
