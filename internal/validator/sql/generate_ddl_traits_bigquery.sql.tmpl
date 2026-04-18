@@ -1,6 +1,9 @@
 SELECT 'CREATE EXTERNAL TABLE {{.LoaderTable}} (' || chr(10)
     || array_join(
-        transform(bigquery, c -> '    `' || c.Name || '` string'),
+        transform(
+            array_distinct(transform(bigquery, c -> c.Name)),
+            n -> '    `' || n || '` string'
+        ),
         ',' || chr(10)
     ) || chr(10)
     || ')' || chr(10)

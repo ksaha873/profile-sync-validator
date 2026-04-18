@@ -111,16 +111,23 @@ func (o *Orchestrator) runValidation(ctx context.Context, queryType string, rend
 	if err != nil {
 		return &SystemError{Step: step + "_render", Err: err}
 	}
-	count, err := o.athena.ExecScalarInt64(ctx, step, sql)
+	counts, err := o.athena.ExecRowInt64s(ctx, step, sql)
 	if err != nil {
 		return err
 	}
-	if count > 0 {
-		return &ValidationError{
-			Artifact:      o.artifact.Kind(),
-			QueryType:     queryType,
-			MismatchCount: count,
-		}
+	if len(counts) != 3 {
+		return &SystemError{Step: step, Err: fmt.Errorf("expected 3 counts, got %d", len(counts))}
+	}
+	expected, loader, mismatch := counts[0], counts[1], counts[2]
+	log.Printf("[%s %s] expected=%d loader=%d mismatch=%d", o.artifact.Kind(), queryType, expected, loader, mismatch)
+
+	switch {
+	case expected == 0:
+		return &ValidationError{Artifact: o.artifact.Kind(), QueryType: queryType, Stage: "expected_empty", Count: 0}
+	case loader == 0:
+		return &ValidationError{Artifact: o.artifact.Kind(), QueryType: queryType, Stage: "loader_empty", Count: 0}
+	case mismatch > 0:
+		return &ValidationError{Artifact: o.artifact.Kind(), QueryType: queryType, Stage: "mismatch", Count: mismatch}
 	}
 	return nil
 }

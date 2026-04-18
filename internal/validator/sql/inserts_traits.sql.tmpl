@@ -70,7 +70,7 @@ loader AS (
                 AND CAST(to_unixtime(from_iso8601_timestamp(p.end_at)) * 1000000000 AS bigint)
     ) WHERE rn = 1
 )
-SELECT COUNT(*) AS mismatch_count
-FROM patches p
-    LEFT JOIN loader l ON p.id = l.id AND p.accepted_at = l.accepted_at
-WHERE l.id IS NULL
+SELECT
+    (SELECT COUNT(*) FROM patches) AS expected_count,
+    (SELECT COUNT(*) FROM loader)  AS loader_count,
+    (SELECT COUNT(*) FROM patches p LEFT JOIN loader l ON p.id = l.id AND p.accepted_at = l.accepted_at WHERE l.id IS NULL) AS mismatch_count

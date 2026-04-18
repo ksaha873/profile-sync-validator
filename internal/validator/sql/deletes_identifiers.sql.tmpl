@@ -53,7 +53,7 @@ loader AS (
             to_unixtime(from_iso8601_timestamp((SELECT end_at FROM params))) * 1000000000 AS bigint
         )
 )
-SELECT COUNT(*) AS mismatch_count
-FROM expected_deletes p
-    LEFT JOIN loader l ON p.id = l.id AND p.accepted_at = l.accepted_at
-WHERE l.id IS NULL
+SELECT
+    (SELECT COUNT(*) FROM expected_deletes) AS expected_count,
+    (SELECT COUNT(*) FROM loader)           AS loader_count,
+    (SELECT COUNT(*) FROM expected_deletes p LEFT JOIN loader l ON p.id = l.id AND p.accepted_at = l.accepted_at WHERE l.id IS NULL) AS mismatch_count

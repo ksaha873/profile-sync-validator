@@ -24,16 +24,26 @@ func (e *SystemError) Error() string {
 
 func (e *SystemError) Unwrap() error { return e.Err }
 
-// ValidationError indicates the final count(*) query returned a non-zero
-// mismatch count — the archiver produced data that the loader did not write.
+// ValidationError indicates one of the 3 staged checks failed:
+//   - Stage "expected_empty": 0 rows returned from the data_v3 side
+//   - Stage "loader_empty":   0 rows returned from the loader side
+//   - Stage "mismatch":       final left-join found unmatched rows
 type ValidationError struct {
 	Artifact      ArtifactKind
 	QueryType     string // "inserts" | "deletes"
-	MismatchCount int64
+	Stage         string // "expected_empty" | "loader_empty" | "mismatch"
+	Count         int64  // expected/loader row count for empty stages; mismatch count for mismatch stage
 }
 
 func (e *ValidationError) Error() string {
-	return fmt.Sprintf("validation mismatch: %s %s has %d unmatched rows", e.Artifact, e.QueryType, e.MismatchCount)
+	switch e.Stage {
+	case "expected_empty":
+		return fmt.Sprintf("validation failure: %s %s expected-rows (data_v3) returned 0 rows", e.Artifact, e.QueryType)
+	case "loader_empty":
+		return fmt.Sprintf("validation failure: %s %s loader-rows returned 0 rows", e.Artifact, e.QueryType)
+	default:
+		return fmt.Sprintf("validation mismatch: %s %s has %d unmatched rows", e.Artifact, e.QueryType, e.Count)
+	}
 }
 
 // MultiError aggregates errors from parallel steps. A non-nil MultiError always
