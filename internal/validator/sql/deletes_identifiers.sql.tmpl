@@ -56,4 +56,5 @@ loader AS (
 SELECT
     (SELECT COUNT(*) FROM expected_deletes) AS expected_count,
     (SELECT COUNT(*) FROM loader)           AS loader_count,
-    (SELECT COUNT(*) FROM expected_deletes p LEFT JOIN loader l ON p.id = l.id AND p.accepted_at = l.accepted_at WHERE l.id IS NULL) AS mismatch_count
+    (SELECT COUNT(*) FROM expected_deletes p LEFT JOIN loader l ON p.id = l.id AND p.accepted_at = l.accepted_at WHERE l.id IS NULL) AS mismatch_count,
+    (SELECT COUNT(*) FROM loader l LEFT JOIN expected_deletes p ON p.id = l.id AND p.accepted_at = l.accepted_at WHERE p.id IS NULL) AS reverse_mismatch_count
