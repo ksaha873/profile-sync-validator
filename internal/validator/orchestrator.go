@@ -2,7 +2,6 @@ package validator
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -62,38 +61,59 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	return joinErrors(insertsErr, deletesErr)
 }
 
-// runDeletesWithTombstoneCheck runs the deletes validation, and if it reports a
-// mismatch, runs a follow-up tombstone-exclusion check. The returned error
-// reflects the remaining mismatch count after excluding tombstoned segments.
+// runDeletesWithTombstoneCheck runs the deletes validation (which returns 4
+// counts: expected, loader, mismatch, reverse_mismatch) and runs the
+// tombstone-exclusion follow-up if mismatch > 0. Returns a MultiError with both
+// the post-tombstone mismatch and the reverse mismatch when both are non-zero;
+// either can be nil independently.
 func (o *Orchestrator) runDeletesWithTombstoneCheck(ctx context.Context) error {
-	err := o.runValidation(ctx, "deletes", o.artifact.DeletesSQL)
-	if err == nil {
-		return nil
+	step := fmt.Sprintf("run_deletes_%s", o.artifact.Kind())
+	sql, err := o.artifact.DeletesSQL(o.target, o.run)
+	if err != nil {
+		return &SystemError{Step: step + "_render", Err: err}
 	}
-	var ve *ValidationError
-	if !errors.As(err, &ve) || ve.Stage != "mismatch" {
+	counts, err := o.athena.ExecRowInt64s(ctx, step, sql)
+	if err != nil {
 		return err
 	}
+	if len(counts) != 4 {
+		return &SystemError{Step: step, Err: fmt.Errorf("expected 4 counts, got %d", len(counts))}
+	}
+	expected, loader, mismatch, reverse := counts[0], counts[1], counts[2], counts[3]
+	log.Printf("[%s deletes] expected=%d loader=%d mismatch=%d reverse_mismatch=%d",
+		o.artifact.Kind(), expected, loader, mismatch, reverse)
 
-	step := fmt.Sprintf("run_tombstoned_check_deletes_%s", o.artifact.Kind())
-	sql, rerr := o.artifact.TombstonedCheckSQL(o.target, o.run)
-	if rerr != nil {
-		return &SystemError{Step: step + "_render", Err: rerr}
+	switch {
+	case expected == 0:
+		return &ValidationError{Artifact: o.artifact.Kind(), QueryType: "deletes", Stage: "expected_empty"}
+	case loader == 0:
+		return &ValidationError{Artifact: o.artifact.Kind(), QueryType: "deletes", Stage: "loader_empty"}
 	}
-	remaining, cerr := o.athena.ExecScalarInt64(ctx, step, sql)
-	if cerr != nil {
-		return cerr
+
+	var primaryErr, reverseErr error
+	if mismatch > 0 {
+		tsStep := fmt.Sprintf("run_tombstoned_check_deletes_%s", o.artifact.Kind())
+		tsSQL, rerr := o.artifact.TombstonedCheckSQL(o.target, o.run)
+		if rerr != nil {
+			return &SystemError{Step: tsStep + "_render", Err: rerr}
+		}
+		remaining, cerr := o.athena.ExecScalarInt64(ctx, tsStep, tsSQL)
+		if cerr != nil {
+			return cerr
+		}
+		log.Printf("[%s deletes] tombstone-excluded remaining=%d (was mismatch=%d)", o.artifact.Kind(), remaining, mismatch)
+		if remaining > 0 {
+			primaryErr = &ValidationError{
+				Artifact: o.artifact.Kind(), QueryType: "deletes", Stage: "mismatch", Count: remaining,
+			}
+		}
 	}
-	log.Printf("[%s deletes] tombstone-excluded remaining=%d (was mismatch=%d)", o.artifact.Kind(), remaining, ve.Count)
-	if remaining == 0 {
-		return nil
+	if reverse > 0 {
+		reverseErr = &ValidationError{
+			Artifact: o.artifact.Kind(), QueryType: "deletes", Stage: "reverse_mismatch", Count: reverse,
+		}
 	}
-	return &ValidationError{
-		Artifact:  o.artifact.Kind(),
-		QueryType: "deletes",
-		Stage:     "mismatch",
-		Count:     remaining,
-	}
+	return joinErrors(primaryErr, reverseErr)
 }
 
 func (o *Orchestrator) createSchemaReader(ctx context.Context) error {
