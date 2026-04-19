@@ -9,6 +9,13 @@ type ArtifactType interface {
 	LoaderTable(spaceShortID string) string
 	InsertsSQL(t WarehouseTarget, r ValidationRun) (string, error)
 	DeletesSQL(t WarehouseTarget, r ValidationRun) (string, error)
+
+	// TombstonedCheckSQL returns a query with two counts:
+	//   col0 = total unmatched delete rows
+	//   col1 = unmatched rows whose canonical_segment_id was TOMBSTONED in the
+	//          tombstoned window (these are legitimate loader skips).
+	// Orchestrator uses this only when deletes mismatch > 0.
+	TombstonedCheckSQL(t WarehouseTarget, r ValidationRun) (string, error)
 }
 
 func NewArtifactType(kind ArtifactKind) (ArtifactType, error) {
@@ -87,6 +94,10 @@ func (a identifiersArtifact) DeletesSQL(t WarehouseTarget, r ValidationRun) (str
 	return renderTemplate("deletes_identifiers.sql.tmpl", validationData(a, t, r))
 }
 
+func (a identifiersArtifact) TombstonedCheckSQL(t WarehouseTarget, r ValidationRun) (string, error) {
+	return renderTemplate("tombstoned_check_deletes_identifiers.sql.tmpl", validationData(a, t, r))
+}
+
 // --- Traits ---
 
 type traitsArtifact struct{}
@@ -107,4 +118,8 @@ func (a traitsArtifact) InsertsSQL(t WarehouseTarget, r ValidationRun) (string, 
 
 func (a traitsArtifact) DeletesSQL(t WarehouseTarget, r ValidationRun) (string, error) {
 	return renderTemplate("deletes_traits.sql.tmpl", validationData(a, t, r))
+}
+
+func (a traitsArtifact) TombstonedCheckSQL(t WarehouseTarget, r ValidationRun) (string, error) {
+	return renderTemplate("tombstoned_check_deletes_traits.sql.tmpl", validationData(a, t, r))
 }
