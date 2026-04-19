@@ -1,0 +1,75 @@
+WITH params AS (
+    SELECT '{{.SpaceID}}' AS space_id,
+        '{{.Day}}' AS day,
+        '{{.StartAt}}' AS start_at,
+        '{{.EndAt}}' AS end_at,
+        '{{.TombstonedStartAt}}' AS tombstoned_start_at,
+        '{{.TombstonedEndAt}}' AS tombstoned_end_at
+),
+filtered_merged AS (
+    SELECT d.*, d."$path" AS s3_path
+    FROM {{.DataV3Table}} d
+    WHERE d.namespace_id = (SELECT space_id FROM params)
+        AND d.day_written = CAST(CAST(to_unixtime(date_parse((SELECT day FROM params), '%Y-%m-%d')) * 1000 AS BIGINT) AS VARCHAR)
+        AND d.summary = 'MERGED'
+        AND d.segment_id NOT LIKE 'acc_%'
+        AND d.accepted_at >= (SELECT start_at FROM params)
+        AND d.accepted_at < (SELECT end_at FROM params)
+),
+identifier_deletes AS (
+    SELECT p.segment_id AS canonical_segment_id,
+        m.from_segment_id AS affected_segment_id,
+        lower(to_hex(sha1(to_utf8(m.from_segment_id || id.type || id.id)))) AS id,
+        date_format(from_iso8601_timestamp(p.accepted_at), '%Y-%m-%dT%H:%i:%s.') ||
+        LPAD(CAST(millisecond(from_iso8601_timestamp(p.accepted_at)) AS varchar), 3, '0') || 'Z' AS accepted_at
+    FROM filtered_merged p
+        CROSS JOIN UNNEST(p.merges) AS t(m)
+        CROSS JOIN UNNEST(p.identifiers) AS t2(id)
+),
+link_deletes AS (
+    SELECT p.segment_id AS canonical_segment_id,
+        m.from_segment_id AS affected_segment_id,
+        lower(to_hex(sha1(to_utf8(m.from_segment_id || 'group_id' || lnk.group_id)))) AS id,
+        date_format(from_iso8601_timestamp(p.accepted_at), '%Y-%m-%dT%H:%i:%s.') ||
+        LPAD(CAST(millisecond(from_iso8601_timestamp(p.accepted_at)) AS varchar), 3, '0') || 'Z' AS accepted_at
+    FROM filtered_merged p
+        CROSS JOIN UNNEST(p.merges) AS t(m)
+        CROSS JOIN UNNEST(p.links) AS t2(lnk)
+),
+expected_deletes AS (
+    SELECT canonical_segment_id, affected_segment_id, id, accepted_at FROM identifier_deletes
+    UNION
+    SELECT canonical_segment_id, affected_segment_id, id, accepted_at FROM link_deletes
+),
+loader AS (
+    SELECT canonical_segment_id, lower(id) AS id,
+        date_format(from_unixtime(CAST(CAST(l.{{.ProfileVersionCol}} AS bigint) / 1000000000 AS double)), '%Y-%m-%dT%H:%i:%s.') ||
+        LPAD(CAST((CAST(l.{{.ProfileVersionCol}} AS bigint) / 1000000) % 1000 AS varchar), 3, '0') || 'Z' AS accepted_at
+    FROM {{.LoaderTable}} l
+    WHERE l."$path" LIKE '{{.OutputPathPattern}}'
+        AND l.{{.DeletedCol}} = 'true'
+        AND CAST(l.{{.ProfileVersionCol}} AS bigint) BETWEEN CAST(
+            to_unixtime(from_iso8601_timestamp((SELECT start_at FROM params))) * 1000000000 AS bigint
+        )
+        AND CAST(
+            to_unixtime(from_iso8601_timestamp((SELECT end_at FROM params))) * 1000000000 AS bigint
+        )
+),
+unmatched AS (
+    SELECT p.affected_segment_id
+    FROM expected_deletes p
+        LEFT JOIN loader l ON p.id = l.id AND p.accepted_at = l.accepted_at
+    WHERE l.id IS NULL
+),
+tombstoned_segments AS (
+    SELECT DISTINCT d.segment_id
+    FROM {{.DataV3Table}} d, params p
+    WHERE d.namespace_id = p.space_id
+        AND d.day_written = CAST(CAST(to_unixtime(date_parse(p.day, '%Y-%m-%d')) * 1000 AS BIGINT) AS VARCHAR)
+        AND d.summary = 'TOMBSTONED'
+        AND d.accepted_at >= p.tombstoned_start_at
+        AND d.accepted_at < p.tombstoned_end_at
+)
+SELECT COUNT(*) AS remaining_unmatched
+FROM unmatched
+WHERE affected_segment_id NOT IN (SELECT segment_id FROM tombstoned_segments)
