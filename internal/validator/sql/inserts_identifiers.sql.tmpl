@@ -26,7 +26,7 @@ filtered_patches AS (
         AND d.accepted_at < p.end_at
         AND d.segment_id NOT IN (SELECT segment_id FROM merged_segments)
 ),
-unnested_patches AS (
+unnested_identifiers AS (
     SELECT p.segment_id AS canonical_segment_id, id.type,
         id.id AS value,
         lower(to_hex(sha1(to_utf8(p.segment_id || id.type || id.id)))) AS id,
@@ -36,6 +36,23 @@ unnested_patches AS (
     FROM filtered_patches p
         CROSS JOIN UNNEST(p.identifiers) AS t2(id)
     WHERE ((p.summary != 'MERGED' AND id.status = 'ADDED') OR (p.summary = 'MERGED'))
+),
+unnested_links AS (
+    SELECT p.segment_id AS canonical_segment_id,
+        'group_id' AS type,
+        lnk.group_id AS value,
+        lower(to_hex(sha1(to_utf8(p.segment_id || 'group_id' || lnk.group_id)))) AS id,
+        date_format(from_iso8601_timestamp(p.accepted_at), '%Y-%m-%dT%H:%i:%s.') ||
+        LPAD(CAST(millisecond(from_iso8601_timestamp(p.accepted_at)) AS varchar), 3, '0') || 'Z' AS accepted_at,
+        p.s3_path
+    FROM filtered_patches p
+        CROSS JOIN UNNEST(p.links) AS t2(lnk)
+    WHERE ((p.summary != 'MERGED' AND lnk.status IN ('ADDED', 'CHANGED')) OR (p.summary = 'MERGED'))
+),
+unnested_patches AS (
+    SELECT canonical_segment_id, type, value, id, accepted_at, s3_path FROM unnested_identifiers
+    UNION ALL
+    SELECT canonical_segment_id, type, value, id, accepted_at, s3_path FROM unnested_links
 ),
 patches AS (
     SELECT canonical_segment_id, type, value, id, accepted_at, s3_path
