@@ -12,8 +12,8 @@ merged_segments AS (
     WHERE d.namespace_id = p.space_id
         AND d.day_written = CAST(CAST(to_unixtime(date_parse(p.day, '%Y-%m-%d')) * 1000 AS BIGINT) AS VARCHAR)
         AND d.summary = 'TOMBSTONED'
-        AND d.accepted_at >= p.tombstoned_start_at
-        AND d.accepted_at < p.tombstoned_end_at
+        AND from_iso8601_timestamp(d.accepted_at) >= from_iso8601_timestamp(p.tombstoned_start_at)
+        AND from_iso8601_timestamp(d.accepted_at) < from_iso8601_timestamp(p.tombstoned_end_at)
 ),
 filtered_patches AS (
     SELECT d.*, d."$path" AS s3_path
@@ -22,8 +22,8 @@ filtered_patches AS (
         AND d.day_written = CAST(CAST(to_unixtime(date_parse(p.day, '%Y-%m-%d')) * 1000 AS BIGINT) AS VARCHAR)
         AND d.summary IN ('NORMAL', 'CREATED', 'REEMIT', 'MERGED')
         AND d.segment_id NOT LIKE 'acc_%'
-        AND d.accepted_at >= p.start_at
-        AND d.accepted_at < p.end_at
+        AND from_iso8601_timestamp(d.accepted_at) >= from_iso8601_timestamp(p.start_at)
+        AND from_iso8601_timestamp(d.accepted_at) < from_iso8601_timestamp(p.end_at)
         AND d.segment_id NOT IN (SELECT segment_id FROM merged_segments)
 ),
 normalize_key AS (
