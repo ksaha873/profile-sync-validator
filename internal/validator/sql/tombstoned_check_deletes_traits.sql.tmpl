@@ -44,6 +44,7 @@ changed_deletes AS (
             LPAD(CAST(millisecond(from_iso8601_timestamp(accepted_at)) AS varchar), 3, '0') || 'Z' AS accepted_at
     FROM normalize_key
     WHERE summary IN ('NORMAL', 'CREATED', 'REEMIT')
+        AND prev_value IS NOT NULL
         AND prev_value != 'null'
         AND prev_value != ''
 ),

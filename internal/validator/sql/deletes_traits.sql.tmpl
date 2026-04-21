@@ -44,6 +44,7 @@ changed_deletes AS (
         s3_path
     FROM normalize_key
     WHERE summary IN ('NORMAL', 'CREATED', 'REEMIT')
+        AND prev_value IS NOT NULL
         AND prev_value != 'null'
         AND prev_value != ''
 ),
