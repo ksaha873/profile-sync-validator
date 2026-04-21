@@ -12,8 +12,8 @@ filter_patches AS (
         AND d.day_written = CAST(CAST(to_unixtime(date_parse((SELECT day FROM params), '%Y-%m-%d')) * 1000 AS BIGINT) AS VARCHAR)
         AND d.summary IN ('NORMAL', 'CREATED', 'REEMIT', 'MERGED')
         AND d.segment_id NOT LIKE 'acc_%'
-        AND d.accepted_at >= (SELECT start_at FROM params)
-        AND d.accepted_at < (SELECT end_at FROM params)
+        AND from_iso8601_timestamp(d.accepted_at) >= from_iso8601_timestamp((SELECT start_at FROM params))
+        AND from_iso8601_timestamp(d.accepted_at) < from_iso8601_timestamp((SELECT end_at FROM params))
 ),
 normalize_key AS (
     SELECT
