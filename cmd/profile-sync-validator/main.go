@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/athena"
 	"golang.org/x/sync/errgroup"
@@ -28,9 +29,8 @@ func main() {
 	warehouse := flag.String("warehouse", "", "snowflake | bigquery (required)")
 	artifacts := flag.String("artifacts", "identifiers,traits", "Comma-separated: identifiers,traits")
 
-	athenaDB := flag.String("athena-db", "patch_v3", "Athena database")
-	athenaWG := flag.String("athena-workgroup", "primary", "Athena workgroup")
-	athenaOutput := flag.String("athena-output", "", "Athena query result S3 location, e.g. s3://aws-athena-query-results-xxx/ (required)")
+	athenaDB := flag.String("athena-db", "", "Athena database (required)")
+	athenaWG := flag.String("athena-workgroup", "primary", "Athena workgroup; its configured result S3 location is used as the query output")
 	dataV3Table := flag.String("data-v3-table", "data_v3", "Athena table holding V3 patches")
 
 	flag.Parse()
@@ -50,8 +50,8 @@ func main() {
 	if err := run.Validate(); err != nil {
 		fail(err)
 	}
-	if *athenaOutput == "" {
-		fail(fmt.Errorf("athena-output is required"))
+	if *athenaDB == "" {
+		fail(fmt.Errorf("athena-db is required"))
 	}
 
 	kinds, err := parseArtifacts(*artifacts)
@@ -64,12 +64,17 @@ func main() {
 	if err != nil {
 		fail(fmt.Errorf("load aws config: %w", err))
 	}
+	athenaAPI := athena.NewFromConfig(awsCfg)
+	outputLoc, err := resolveWorkgroupOutput(ctx, athenaAPI, *athenaWG)
+	if err != nil {
+		fail(err)
+	}
 	athenaClient := validator.NewAthenaClient(
-		athena.NewFromConfig(awsCfg),
+		athenaAPI,
 		validator.AthenaConfig{
 			Database:  *athenaDB,
 			Workgroup: *athenaWG,
-			OutputLoc: *athenaOutput,
+			OutputLoc: outputLoc,
 		},
 	)
 	target, err := validator.NewWarehouseTarget(run.Warehouse)
@@ -156,6 +161,21 @@ func report(kinds []validator.ArtifactKind, errs []error) {
 			fmt.Printf("[%s] SYSTEM ERROR: %v\n", k, errs[i])
 		}
 	}
+}
+
+func resolveWorkgroupOutput(ctx context.Context, api *athena.Client, workgroup string) (string, error) {
+	out, err := api.GetWorkGroup(ctx, &athena.GetWorkGroupInput{WorkGroup: aws.String(workgroup)})
+	if err != nil {
+		return "", fmt.Errorf("get workgroup %q: %w", workgroup, err)
+	}
+	if out.WorkGroup == nil || out.WorkGroup.Configuration == nil || out.WorkGroup.Configuration.ResultConfiguration == nil {
+		return "", fmt.Errorf("workgroup %q has no result configuration", workgroup)
+	}
+	loc := aws.ToString(out.WorkGroup.Configuration.ResultConfiguration.OutputLocation)
+	if loc == "" {
+		return "", fmt.Errorf("workgroup %q has no result OutputLocation set", workgroup)
+	}
+	return loc, nil
 }
 
 func fail(err error) {

@@ -43,8 +43,11 @@ aws-okta exec prod-write -- go run ./cmd/profile-sync-validator \
   --tombstoned-start-at 2026-04-16T22:00:00Z \
   --tombstoned-end-at   2026-04-17T03:00:00Z \
   --warehouse snowflake \
-  --athena-output s3://aws-athena-query-results-xxx/
+  --athena-db segment_profiles \
+  --athena-workgroup primary
 ```
+
+The query result S3 location is looked up from the workgroup's `ResultConfiguration.OutputLocation` — no need to pass it explicitly.
 
 ### Flags
 
@@ -57,10 +60,9 @@ aws-okta exec prod-write -- go run ./cmd/profile-sync-validator \
 | `--start-at` / `--end-at` | Main time window, RFC3339 (required) |
 | `--tombstoned-start-at` / `--tombstoned-end-at` | Extended window for tombstone lookup — should be ≥2h wider on each side (required) |
 | `--warehouse` | `snowflake` or `bigquery` (required) |
-| `--athena-output` | S3 location for Athena query results (required) |
+| `--athena-db` | Athena database (required) |
+| `--athena-workgroup` | Athena workgroup; its configured result S3 location is used as the query output (default `primary`) |
 | `--artifacts` | `identifiers`, `traits`, or both comma-separated (default: both) |
-| `--athena-db` | Athena database (default `patch_v3`) |
-| `--athena-workgroup` | Athena workgroup (default `primary`) |
 | `--data-v3-table` | Athena table with V3 patches (default `data_v3`) |
 
 ## Layout
