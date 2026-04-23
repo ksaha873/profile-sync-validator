@@ -22,6 +22,20 @@ type Orchestrator struct {
 	createdTables []string
 }
 
+// StepResult captures the raw counts from a single inserts/deletes validation
+// step, so callers can render their own summary views in addition to the
+// per-step log lines.
+type StepResult struct {
+	Artifact           ArtifactKind
+	QueryType          string // "inserts" | "deletes"
+	Expected           int64
+	Loader             int64
+	Mismatch           int64  // post-tombstone for deletes if TombstoneChecked
+	MismatchRaw        int64  // pre-tombstone mismatch (deletes only)
+	ReverseMismatch    int64  // deletes only
+	TombstoneChecked   bool   // true when the tombstone follow-up ran
+}
+
 func NewOrchestrator(a *AthenaClient, r ValidationRun, target WarehouseTarget, artifact ArtifactType) *Orchestrator {
 	return &Orchestrator{
 		athena:   a,
@@ -37,28 +51,31 @@ func NewOrchestrator(a *AthenaClient, r ValidationRun, target WarehouseTarget, a
 //  3. run inserts and deletes in parallel; collect both errors
 //
 // All created tables are dropped via deferred cleanup regardless of outcome.
-func (o *Orchestrator) Run(ctx context.Context) error {
+// Returns per-step counts alongside any error, so callers can surface a
+// summary even when validation fails.
+func (o *Orchestrator) Run(ctx context.Context) ([]StepResult, error) {
 	defer o.dropAllTables()
 
 	if err := o.createSchemaReader(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	if err := o.createLoaderTable(ctx); err != nil {
-		return err
+		return nil, err
 	}
 
 	var eg errgroup.Group
+	var insertsRes, deletesRes StepResult
 	var insertsErr, deletesErr error
 	eg.Go(func() error {
-		insertsErr = o.runValidation(ctx, "inserts", o.artifact.InsertsSQL)
+		insertsRes, insertsErr = o.runValidation(ctx, "inserts", o.artifact.InsertsSQL)
 		return nil
 	})
 	eg.Go(func() error {
-		deletesErr = o.runDeletesWithTombstoneCheck(ctx)
+		deletesRes, deletesErr = o.runDeletesWithTombstoneCheck(ctx)
 		return nil
 	})
 	_ = eg.Wait()
-	return joinErrors(insertsErr, deletesErr)
+	return []StepResult{insertsRes, deletesRes}, joinErrors(insertsErr, deletesErr)
 }
 
 // runDeletesWithTombstoneCheck runs the deletes validation (which returns 4
@@ -66,28 +83,34 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 // tombstone-exclusion follow-up if mismatch > 0. Returns a MultiError with both
 // the post-tombstone mismatch and the reverse mismatch when both are non-zero;
 // either can be nil independently.
-func (o *Orchestrator) runDeletesWithTombstoneCheck(ctx context.Context) error {
+func (o *Orchestrator) runDeletesWithTombstoneCheck(ctx context.Context) (StepResult, error) {
+	res := StepResult{Artifact: o.artifact.Kind(), QueryType: "deletes"}
 	step := fmt.Sprintf("run_deletes_%s", o.artifact.Kind())
 	sql, err := o.artifact.DeletesSQL(o.target, o.run)
 	if err != nil {
-		return &SystemError{Step: step + "_render", Err: err}
+		return res, &SystemError{Step: step + "_render", Err: err}
 	}
 	counts, err := o.athena.ExecRowInt64s(ctx, step, sql)
 	if err != nil {
-		return err
+		return res, err
 	}
 	if len(counts) != 4 {
-		return &SystemError{Step: step, Err: fmt.Errorf("expected 4 counts, got %d", len(counts))}
+		return res, &SystemError{Step: step, Err: fmt.Errorf("expected 4 counts, got %d", len(counts))}
 	}
 	expected, loader, mismatch, reverse := counts[0], counts[1], counts[2], counts[3]
+	res.Expected = expected
+	res.Loader = loader
+	res.MismatchRaw = mismatch
+	res.Mismatch = mismatch
+	res.ReverseMismatch = reverse
 	log.Printf("[%s deletes] expected=%d loader=%d mismatch=%d reverse_mismatch=%d",
 		o.artifact.Kind(), expected, loader, mismatch, reverse)
 
 	switch {
 	case expected == 0:
-		return &ValidationError{Artifact: o.artifact.Kind(), QueryType: "deletes", Stage: "expected_empty"}
+		return res, &ValidationError{Artifact: o.artifact.Kind(), QueryType: "deletes", Stage: "expected_empty"}
 	case loader == 0:
-		return &ValidationError{Artifact: o.artifact.Kind(), QueryType: "deletes", Stage: "loader_empty"}
+		return res, &ValidationError{Artifact: o.artifact.Kind(), QueryType: "deletes", Stage: "loader_empty"}
 	}
 
 	var primaryErr, reverseErr error
@@ -95,12 +118,14 @@ func (o *Orchestrator) runDeletesWithTombstoneCheck(ctx context.Context) error {
 		tsStep := fmt.Sprintf("run_tombstoned_check_deletes_%s", o.artifact.Kind())
 		tsSQL, rerr := o.artifact.TombstonedCheckSQL(o.target, o.run)
 		if rerr != nil {
-			return &SystemError{Step: tsStep + "_render", Err: rerr}
+			return res, &SystemError{Step: tsStep + "_render", Err: rerr}
 		}
 		remaining, cerr := o.athena.ExecScalarInt64(ctx, tsStep, tsSQL)
 		if cerr != nil {
-			return cerr
+			return res, cerr
 		}
+		res.TombstoneChecked = true
+		res.Mismatch = remaining
 		log.Printf("[%s deletes] tombstone-excluded remaining=%d (was mismatch=%d)", o.artifact.Kind(), remaining, mismatch)
 		if remaining > 0 {
 			primaryErr = &ValidationError{
@@ -113,7 +138,7 @@ func (o *Orchestrator) runDeletesWithTombstoneCheck(ctx context.Context) error {
 			Artifact: o.artifact.Kind(), QueryType: "deletes", Stage: "reverse_mismatch", Count: reverse,
 		}
 	}
-	return joinErrors(primaryErr, reverseErr)
+	return res, joinErrors(primaryErr, reverseErr)
 }
 
 func (o *Orchestrator) createSchemaReader(ctx context.Context) error {
@@ -160,31 +185,36 @@ func (o *Orchestrator) createLoaderTable(ctx context.Context) error {
 
 type sqlRenderer func(t WarehouseTarget, r ValidationRun) (string, error)
 
-func (o *Orchestrator) runValidation(ctx context.Context, queryType string, render sqlRenderer) error {
+func (o *Orchestrator) runValidation(ctx context.Context, queryType string, render sqlRenderer) (StepResult, error) {
+	res := StepResult{Artifact: o.artifact.Kind(), QueryType: queryType}
 	step := fmt.Sprintf("run_%s_%s", queryType, o.artifact.Kind())
 	sql, err := render(o.target, o.run)
 	if err != nil {
-		return &SystemError{Step: step + "_render", Err: err}
+		return res, &SystemError{Step: step + "_render", Err: err}
 	}
 	counts, err := o.athena.ExecRowInt64s(ctx, step, sql)
 	if err != nil {
-		return err
+		return res, err
 	}
 	if len(counts) != 3 {
-		return &SystemError{Step: step, Err: fmt.Errorf("expected 3 counts, got %d", len(counts))}
+		return res, &SystemError{Step: step, Err: fmt.Errorf("expected 3 counts, got %d", len(counts))}
 	}
 	expected, loader, mismatch := counts[0], counts[1], counts[2]
+	res.Expected = expected
+	res.Loader = loader
+	res.Mismatch = mismatch
+	res.MismatchRaw = mismatch
 	log.Printf("[%s %s] expected=%d loader=%d mismatch=%d", o.artifact.Kind(), queryType, expected, loader, mismatch)
 
 	switch {
 	case expected == 0:
-		return &ValidationError{Artifact: o.artifact.Kind(), QueryType: queryType, Stage: "expected_empty", Count: 0}
+		return res, &ValidationError{Artifact: o.artifact.Kind(), QueryType: queryType, Stage: "expected_empty", Count: 0}
 	case loader == 0:
-		return &ValidationError{Artifact: o.artifact.Kind(), QueryType: queryType, Stage: "loader_empty", Count: 0}
+		return res, &ValidationError{Artifact: o.artifact.Kind(), QueryType: queryType, Stage: "loader_empty", Count: 0}
 	case mismatch > 0:
-		return &ValidationError{Artifact: o.artifact.Kind(), QueryType: queryType, Stage: "mismatch", Count: mismatch}
+		return res, &ValidationError{Artifact: o.artifact.Kind(), QueryType: queryType, Stage: "mismatch", Count: mismatch}
 	}
-	return nil
+	return res, nil
 }
 
 func (o *Orchestrator) track(tbl string) {
