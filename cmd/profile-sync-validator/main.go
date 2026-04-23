@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -84,6 +85,7 @@ func main() {
 
 	var eg errgroup.Group
 	errs := make([]error, len(kinds))
+	results := make([][]validator.StepResult, len(kinds))
 	for i, k := range kinds {
 		i, k := i, k
 		eg.Go(func() error {
@@ -92,7 +94,9 @@ func main() {
 				errs[i] = err
 				return nil
 			}
-			errs[i] = validator.NewOrchestrator(athenaClient, run, target, artifact).Run(ctx)
+			res, runErr := validator.NewOrchestrator(athenaClient, run, target, artifact).Run(ctx)
+			results[i] = res
+			errs[i] = runErr
 			return nil
 		})
 	}
@@ -111,6 +115,7 @@ func main() {
 	}
 
 	report(kinds, errs)
+	printSummaryTable(results)
 
 	switch {
 	case len(sysErrs) > 0:
@@ -161,6 +166,55 @@ func report(kinds []validator.ArtifactKind, errs []error) {
 			fmt.Printf("[%s] SYSTEM ERROR: %v\n", k, errs[i])
 		}
 	}
+}
+
+func printSummaryTable(results [][]validator.StepResult) {
+	var rows []validator.StepResult
+	for _, steps := range results {
+		for _, s := range steps {
+			if s.Artifact == "" {
+				continue
+			}
+			rows = append(rows, s)
+		}
+	}
+	if len(rows) == 0 {
+		return
+	}
+
+	fmt.Println()
+	fmt.Println("Summary:")
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "ARTIFACT\tOPERATION\tEXPECTED\tLOADER\tMISMATCH (RAW)\tMISMATCH (POST-TOMBSTONE)\tREVERSE MISMATCH\tSTATUS")
+	for _, r := range rows {
+		post := "-"
+		if r.QueryType == "deletes" {
+			if r.TombstoneChecked {
+				post = fmt.Sprintf("%d", r.Mismatch)
+			} else {
+				post = "n/a"
+			}
+		}
+		reverse := "-"
+		if r.QueryType == "deletes" {
+			reverse = fmt.Sprintf("%d", r.ReverseMismatch)
+		}
+		status := rowStatus(r)
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\n",
+			r.Artifact, r.QueryType, r.Expected, r.Loader, r.MismatchRaw, post, reverse, status)
+	}
+	tw.Flush()
+}
+
+func rowStatus(r validator.StepResult) string {
+	effective := r.MismatchRaw
+	if r.QueryType == "deletes" && r.TombstoneChecked {
+		effective = r.Mismatch
+	}
+	if effective == 0 && r.ReverseMismatch == 0 && r.Expected > 0 && r.Loader > 0 {
+		return "PASS"
+	}
+	return "FAIL"
 }
 
 func resolveWorkgroupOutput(ctx context.Context, api *athena.Client, workgroup string) (string, error) {
