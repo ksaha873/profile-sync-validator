@@ -39,7 +39,7 @@ normalize_key AS (
             p.s3_path
         FROM filtered_patches p
             CROSS JOIN UNNEST(p.traits) AS t(tr)
-        WHERE ((p.summary != 'MERGED' AND tr.status = 'CHANGED' AND tr.curr_value IS NOT NULL AND tr.curr_value != '' AND tr.curr_value != 'null') OR (p.summary = 'MERGED'))
+        WHERE ((p.summary != 'MERGED' AND tr.status != 'UNCHANGED' AND tr.curr_value IS NOT NULL) OR (p.summary = 'MERGED'))
     )
 ),
 unnested_traits AS (
