@@ -526,7 +526,8 @@ Step 3: Review the generated DDL — BQ schema.json may list `received_at` twice
 
 Notes:
 - Same pattern as identifiers query (#2): TOMBSTONED exclusion with separate time params, MERGED included
-- For MERGED patches, all traits pass through; for others, only status=CHANGED
+- For MERGED patches, all traits pass through; for others, any trait whose `status != 'UNCHANGED'` with a non-null `curr_value` produces an insert. The loader derives Created/Updated purely from prev/curr being nil — a `CONFLICT` row with a non-null curr_value also emits an insert
+- The SQL filter is `tr.curr_value IS NOT NULL` only. An empty string (`''`) or the literal 4-char string `'null'` are valid user values and **do** produce an insert (they correspond to `IsZero() = false` in `patchv3.Dynamic`). Only SQL `NULL` (which is how the Dynamic-null sentinel lands in Athena) should be excluded
 - Trait key normalization matches `go-snakecase`: non-alphanumeric → `_`, camelCase split, collapse `__`, strip leading `_`, lowercase
 - Both the patches and loader sides use `row_number() OVER (PARTITION BY id ORDER BY accepted_at DESC)` to keep only the most recent version of each trait — a trait can be updated multiple times within the time window, and the warehouse only retains the latest value
 - Only the `loader` CTE differs between Snowflake and BigQuery — all other CTEs are identical
@@ -575,7 +576,7 @@ normalize_key AS (
             p.s3_path
         FROM filtered_patches p
             CROSS JOIN UNNEST(p.traits) AS t(tr)
-        WHERE ((p.summary != 'MERGED' AND tr.status = 'CHANGED' AND tr.curr_value IS NOT NULL AND tr.curr_value != '' AND tr.curr_value != 'null') OR (p.summary = 'MERGED'))
+        WHERE ((p.summary != 'MERGED' AND tr.status != 'UNCHANGED' AND tr.curr_value IS NOT NULL) OR (p.summary = 'MERGED'))
     )
 ),
 unnested_traits AS (
@@ -656,7 +657,7 @@ normalize_key AS (
             p.s3_path
         FROM filtered_patches p
             CROSS JOIN UNNEST(p.traits) AS t(tr)
-        WHERE ((p.summary != 'MERGED' AND tr.status = 'CHANGED' AND tr.curr_value IS NOT NULL AND tr.curr_value != '' AND tr.curr_value != 'null') OR (p.summary = 'MERGED'))
+        WHERE ((p.summary != 'MERGED' AND tr.status != 'UNCHANGED' AND tr.curr_value IS NOT NULL) OR (p.summary = 'MERGED'))
     )
 ),
 unnested_traits AS (
@@ -699,7 +700,7 @@ Uses the same loader table created in section 5.
 
 Notes:
 - Handles **two types** of trait deletions:
-  - **Changed deletes**: Non-merge patches (NORMAL, CREATED, REEMIT) where `prev_value` is non-empty and not the literal string `'null'` — the loader writes a delete marker regardless of `curr_value` (so a trait being cleared to null/empty also produces a delete)
+  - **Changed deletes**: Non-merge patches (NORMAL, CREATED, REEMIT) with `status != 'UNCHANGED'` and a non-null `prev_value` — the loader writes a delete marker regardless of `curr_value` (so a trait being cleared to null/empty also produces a delete). An empty string (`''`) or the literal string `'null'` are valid `prev_value`s and **do** produce a delete
   - **Merged deletes**: MERGED patches — the loader generates a delete marker for every `from_segment_id` × every trait on the patch (cartesian product). This produces many redundant deletes (traits that never existed on the losing segment), but that is the current loader logic
 - Trait key normalization matches `go-snakecase`: non-alphanumeric → `_`, camelCase split, collapse `__`, strip leading `_`, lowercase
 - For changed deletes: `id = SHA1(segment_id + normalized_key)`
@@ -774,9 +775,8 @@ changed_deletes AS (
         s3_path
     FROM normalize_key
     WHERE summary IN ('NORMAL', 'CREATED', 'REEMIT')
+        AND trait_status != 'UNCHANGED'
         AND prev_value IS NOT NULL
-        AND prev_value != 'null'
-        AND prev_value != ''
 ),
 merged_deletes AS (
     SELECT
@@ -866,9 +866,8 @@ changed_deletes AS (
         s3_path
     FROM normalize_key
     WHERE summary IN ('NORMAL', 'CREATED', 'REEMIT')
+        AND trait_status != 'UNCHANGED'
         AND prev_value IS NOT NULL
-        AND prev_value != 'null'
-        AND prev_value != ''
 ),
 merged_deletes AS (
     SELECT
@@ -915,7 +914,7 @@ WHERE l.id IS NULL;
 
 2. **Trait key camelCase-to-snake_case conversion does not fully replicate the Go library**: The loader uses the `go-snakecase` Go library to normalize trait keys (e.g., `firstName` -> `first_name`). The Athena queries approximate this with a series of `regexp_replace` calls, but regex-based conversion cannot handle all edge cases that the Go library handles (e.g., sequences of uppercase letters followed by lowercase, certain Unicode characters, or unusual mixed-case patterns). If a trait key mismatch is found, verify the normalized key manually against the Go library output before concluding it is a real discrepancy.
 
-3. **Trait changed deletes depend on prev_value only**: The loader generates a delete marker for a trait on non-merge patches whenever the trait has a meaningful `prev_value` — i.e. `prev_value` is not the empty string and not the literal JSON string `'null'`. The `curr_value` is irrelevant: a trait being cleared (curr_value null/empty) still produces a delete marker, because the old value needs to be removed from the warehouse. Only a trait appearing for the first time (no prior value) produces no delete.
+3. **Trait insert/delete filters track `patchv3.Dynamic.IsZero()`**: The loader's decision to emit an insert or delete row comes from `NewTraitFromPatch` in `warehouse-connectors/downloader/profiles/trait.go`. Traits with `Status == UNCHANGED` are dropped at the `ProfileChanges` split (`patch.go`). Otherwise, Created/Updated/Deleted is derived purely from whether the decoded prev/curr values are `nil`. In `patchv3.Dynamic`, `IsZero()` is true only when the bytes are empty or encode semantic null (JSON `null` / CBOR `0xf6`). JSON `""` and the 4-char string `"null"` are both valid non-nil values and produce an emission. Accordingly, the validation SQL filters on `curr_value IS NOT NULL` (for inserts) and `prev_value IS NOT NULL` (for deletes) only — it must **not** add `!= ''` or `!= 'null'`, as those would drop real user values that the loader did write.
 
 4. **Link deletes in identifier delete validation**: The identifier deletes query (section 3) validates not only identifier delete markers but also **link delete markers**. For MERGED patches, the loader generates a delete marker for every `from_segment_id` x every link (`group_id`) on the patch, using `id = SHA1(from_segment_id + 'group_id' + group_id)`. These link deletes are included in the `expected_deletes` CTE alongside identifier deletes and are matched against the same loader identifiers table (since the loader writes both identifier and link delete markers to the `user_identifiers` output).
 
