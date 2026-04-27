@@ -21,13 +21,106 @@ This skill documents the mechanical recipe.
 
 ## Prerequisites
 
-Before an analysis query will run, the external tables the templates reference must exist in Athena. The validator drops them on exit, so you'll usually need to recreate them first. Render the setup pair from:
+Before an analysis query will run, the external tables the templates reference must exist in Athena. The validator drops them on exit, so you'll usually need to recreate them first.
+
+The templates live at:
 - `internal/validator/sql/schema_reader_{artifact}_{warehouse}.sql.tmpl`
 - `internal/validator/sql/generate_ddl_{artifact}_{warehouse}.sql.tmpl`
 
-substituting the same params the validator used.
+Substitutions are defined in `internal/validator/artifact.go` (`validationTmplData`) and `internal/validator/target.go` (`schemaReaderTmplData`, `generateDDLTmplData`). The `LoaderTable` is `loader_{artifact}_{SpaceID}` and `SchemaReaderTable` is `schema_reader_{artifact}_{SpaceID}`.
 
-The required substitutions are defined in `internal/validator/artifact.go` (`validationTmplData`) and `internal/validator/target.go` (`schemaReaderTmplData`, `generateDDLTmplData`). The `LoaderTable` is `loader_{artifact}_{SpaceID}` and `SchemaReaderTable` is `schema_reader_{artifact}_{SpaceID}`.
+### Prereq DDL — copy-paste recipe
+
+Always emit these in the order shown: schema reader, then meta-query (its output is a CREATE EXTERNAL TABLE string that must be run as a separate query).
+
+Buckets & path patterns by warehouse:
+
+| warehouse | bucket | schema reader column shape | output path LIKE |
+|---|---|---|---|
+| snowflake | `segment-warehouse-snowflake` | `columns array<struct<name:string, type:string>>` | `%output%csv.gz` |
+| bigquery | `segment-warehouse-bigquery`  | `bigquery array<struct<Name:string, Type:string>>` | `%output%.json.gz` |
+
+Path prefix in both cases: `s3://{bucket}/{warehouse_id}/personas_{space_id}/{schema_name}/user_{artifact}/`.
+
+#### Snowflake — traits (swap `traits`→`identifiers` and `user_traits/`→`user_identifiers/` for the identifiers variant)
+
+**Step 1 — schema reader:**
+```sql
+DROP TABLE IF EXISTS schema_reader_traits_{space_id};
+
+CREATE EXTERNAL TABLE schema_reader_traits_{space_id} (
+    columns array<struct<name:string, type:string>>
+)
+ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
+STORED AS INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat'
+OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+LOCATION 's3://segment-warehouse-snowflake/{warehouse_id}/personas_{space_id}/{schema_name}/user_traits/';
+```
+
+**Step 2 — meta-query (output is a DDL string; run that string next):**
+```sql
+DROP TABLE IF EXISTS loader_traits_{space_id};
+
+SELECT 'CREATE EXTERNAL TABLE loader_traits_{space_id} (' || chr(10)
+    || array_join(transform(columns, c -> '    `' || c.name || '` string'), ',' || chr(10))
+    || chr(10) || ')' || chr(10)
+    || 'ROW FORMAT DELIMITED FIELDS TERMINATED BY '',''' || chr(10)
+    || 'STORED AS INPUTFORMAT ''org.apache.hadoop.mapred.TextInputFormat''' || chr(10)
+    || 'OUTPUTFORMAT ''org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat''' || chr(10)
+    || 'LOCATION ''s3://segment-warehouse-snowflake/{warehouse_id}/personas_{space_id}/{schema_name}/user_traits/'''
+    AS ddl
+FROM schema_reader_traits_{space_id}
+WHERE "$path" LIKE '%schema.json'
+LIMIT 1;
+```
+
+#### BigQuery — traits (swap `traits`→`identifiers` and `user_traits/`→`user_identifiers/` for the identifiers variant)
+
+**Step 1 — schema reader:**
+```sql
+DROP TABLE IF EXISTS schema_reader_traits_{space_id};
+
+CREATE EXTERNAL TABLE schema_reader_traits_{space_id} (
+    bigquery array<struct<Name:string, Type:string>>
+)
+ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
+STORED AS INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat'
+OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+LOCATION 's3://segment-warehouse-bigquery/{warehouse_id}/personas_{space_id}/{schema_name}/user_traits/';
+```
+
+**Step 2 — meta-query (iterates `bigquery` struct-array, not `columns`; emits JSON SerDe DDL):**
+```sql
+DROP TABLE IF EXISTS loader_traits_{space_id};
+
+SELECT 'CREATE EXTERNAL TABLE loader_traits_{space_id} (' || chr(10)
+    || array_join(transform(bigquery, c -> '    `' || c.Name || '` string'), ',' || chr(10))
+    || chr(10) || ')' || chr(10)
+    || 'ROW FORMAT SERDE ''org.openx.data.jsonserde.JsonSerDe''' || chr(10)
+    || 'WITH SERDEPROPERTIES (''ignore.malformed.json'' = ''true'')' || chr(10)
+    || 'STORED AS INPUTFORMAT ''org.apache.hadoop.mapred.TextInputFormat''' || chr(10)
+    || 'OUTPUTFORMAT ''org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat''' || chr(10)
+    || 'LOCATION ''s3://segment-warehouse-bigquery/{warehouse_id}/personas_{space_id}/{schema_name}/user_traits/'''
+    AS ddl
+FROM schema_reader_traits_{space_id}
+WHERE "$path" LIKE '%schema.json'
+LIMIT 1;
+```
+
+**BigQuery caveat:** review the generated DDL for duplicate columns (schema.json can list `received_at` twice); remove duplicates before running.
+
+### Substitutions
+
+When generating DDL for a user request, substitute all four tokens before emitting:
+
+| token | source | example |
+|---|---|---|
+| `{space_id}` | user-provided space ID (with `spa_` prefix) | `spa_kYudtEBSHBDXhzR3xWhprZ` |
+| `{warehouse_id}` | user-provided warehouse source ID | `ePokgNuAKyEdoLtWwa91fn` |
+| `{schema_name}` | user-provided schema/project slug | `dig_engage_dev` |
+| `{artifact}` | `traits` or `identifiers` (depends on which mismatch they're debugging) | `traits` |
+
+The `SpaceID` is used verbatim as the table-name suffix (no transformation) — so the loader table for the example above is `loader_traits_spa_kYudtEBSHBDXhzR3xWhprZ`.
 
 ## Recipe: turn a template into an analysis query
 
